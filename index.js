@@ -1,55 +1,70 @@
 import express from 'express';
 import bodyParser from 'body-parser';
-import { spawn } from 'child_process';
+import * as k8s from '@kubernetes/client-node';
 
 const app = express();
 app.use(bodyParser.json());
+const kc = new k8s.KubeConfig();
+kc.loadFromCluster();
 
-const KUBECTL_APPLY_JOB = `
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: velero-restore-job
-  namespace: velero
-spec:
-  template:
-    spec:
-      serviceAccountName: velero
-      restartPolicy: Never
-      containers:
-        - name: velero
-          image: velero/velero:v1.15.2
-          command: ["velero", "restore", "create", "--from-backup", "backup-nginx"]
-`;
+const k8sApi = kc.makeApiClient(k8s.BatchV1Api);
 
-app.post('/api/trigger', (req, res) => {
+app.post('/api/trigger', async (req, res) => {
     const data = req.body;
 
     if (data.alerts && data.alerts[0].status === "firing") {
         const alertName = data.alerts[0].labels.alertname;
+
         if (alertName === "Cluster2Down") {
-            console.log("Cluster A is down! Creating Velero restore job...");
+            async function createVeleroRestoreJob() {
+                const jobName = `velero-restore-job-${Date.now()}`; // Unique job name
+                const jobManifest = {
+                    apiVersion: "batch/v1",
+                    kind: "Job",
+                    metadata: {git 
+                        name: jobName,
+                        namespace: "velero"
+                    },
+                    spec: {
+                        template: {
+                            spec: {
+                                serviceAccountName: "velero-sa",
+                                containers: [
+                                    {
+                                        name: "velero",
+                                        image: "velero/velero:v1.15.2",
+                                        command: ["/velero", "restore", "create", "--from-backup", "backup-nginx"]
+                                    }
+                                ],
+                                restartPolicy: "Never"
+                            }
+                        }
+                    }
+                };
 
-            // Run kubectl apply with the hardcoded YAML job
-            const kubectl = spawn('kubectl', ['apply', '-f', '-']);
-            kubectl.stdin.write(KUBECTL_APPLY_JOB);
-            kubectl.stdin.end();
-
-            kubectl.stdout.on('data', (data) => console.log(`stdout: ${data}`));
-            kubectl.stderr.on('data', (data) => console.error(`stderr: ${data}`));
-
-            kubectl.on('close', (code) => {
-                if (code === 0) {
-                    res.status(200).json({ status: "success", message: "Velero restore job triggered" });
-                } else {
-                    res.status(500).json({ status: "error", message: `kubectl apply failed with code ${code}` });
+                try {
+                    const response = await k8sApi.createNamespacedJob({ 
+                        namespace: "velero", 
+                        body: jobManifest 
+                      });
+                    console.log("Job created:", response.body);
+                    return response.body;
+                } catch (error) {
+                    console.error("Error creating job:", error);
+                    throw error;
                 }
-            });
-            return;
+            }
+
+            try {
+                await createVeleroRestoreJob();
+                return res.status(200).json({ status: "success", message: "Velero restore job triggered" });
+            } catch (error) {
+                return res.status(500).json({ status: "error", message: "Failed to create Velero restore job", error: error.message });
+            }
         }
     }
 
-    res.status(400).json({ status: "ignored", message: "No relevant alert received" });
+    return res.status(400).json({ status: "ignored", message: "No relevant alert received" });
 });
 
 app.listen(3000, () => {
